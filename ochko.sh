@@ -1,19 +1,13 @@
 #!/bin/bash
 
 # =================================================================
-# ULTIMATE HA CLUSTER DEPLOYMENT SCRIPT (REMASTERED)
-# Fixes: Dead CentOS 7 Repos on ALL nodes, SELinux disabled, MariaDB 10.11
+# FIXED HA CLUSTER DEPLOYMENT (SHELL SQL EDITION)
 # =================================================================
 
-# --- 0. НАСТРОЙКИ IP (ПРОВЕРЬ ПЕРЕД ЗАПУСКОМ!) ---
-# Балансировщик
+# --- 0. НАСТРОЙКИ IP ---
 LB_IP="192.168.4.10"
-
-# Веб-сервера (WordPress)
 WEB1_IP="192.168.4.11"
 WEB2_IP="192.168.4.12"
-
-# Базы данных (Galera Cluster)
 DB1_IP="192.168.4.21"
 DB2_IP="192.168.4.22"
 
@@ -22,21 +16,21 @@ DB_ROOT_PASS="password3204"
 WP_DB_PASS="wppassword"
 HAPROXY_CHECK_PASS="haproxypass"
 
-echo ">>> [INIT] Начинаем развертывание правильного кластера..."
+echo ">>> [INIT] Начинаем развертывание. Режим: Hardcore Shell SQL..."
 
-# --- 1. ЛОКАЛЬНАЯ ПОДГОТОВКА (Машина, где запущен скрипт) ---
-echo ">>> [LOCAL] Фикс локальных репозиториев и установка Ansible..."
+# --- 1. ЛОКАЛЬНАЯ ПОДГОТОВКА ---
+echo ">>> [LOCAL] Фикс репозиториев и установка Ansible..."
 
-# Фикс репозиториев (стиль из твоих скринов)
+# Жесткий фикс репо на локальной машине
 sed -i 's/mirror.centos.org/vault.centos.org/g' /etc/yum.repos.d/CentOS*
 sed -i 's/^#.*baseurl=http/baseurl=http/g' /etc/yum.repos.d/CentOS*
 sed -i 's/^mirrorlist=http/#mirrorlist=http/g' /etc/yum.repos.d/CentOS*
 
 yum install -y epel-release
-yum install -y ansible
+yum install -y ansible sshpass
 
 # --- 2. ГЕНЕРАЦИЯ ИНВЕНТАРЯ ---
-echo ">>> [INVENTORY] Создаем /etc/ansible/hosts..."
+echo ">>> [INVENTORY] Генерация хостов..."
 cat <<EOF > /etc/ansible/hosts
 [all_servers]
 $LB_IP
@@ -60,23 +54,22 @@ $DB2_IP
 $DB1_IP
 EOF
 
-# Отключаем проверку ключей SSH (чтобы не спрашивал yes/no)
 cat <<EOF > /etc/ansible/ansible.cfg
 [defaults]
 host_key_checking = False
 deprecation_warnings = False
 command_warnings = False
+forks = 10
 EOF
 
-# --- 3. ПЛЕЙБУК: ОБЩАЯ НАСТРОЙКА (ВАЖНО!) ---
-# Этот плейбук чинит репозитории на ВСЕХ нодах перед установкой чего-либо.
-cat <<EOF > /etc/ansible/00_common_setup.yml
+# --- 3. COMMON SETUP (ФИКС РЕПО ВЕЗДЕ) ---
+cat <<EOF > /etc/ansible/00_common.yml
 ---
-- name: Prepare ALL Servers (Repos & SELinux)
+- name: Prepare Servers
   hosts: all_servers
   become: yes
   tasks:
-    - name: Fix CentOS 7 Repositories (Vault)
+    - name: Fix CentOS 7 Repos (Vault)
       shell: |
         sed -i 's/mirror.centos.org/vault.centos.org/g' /etc/yum.repos.d/CentOS*
         sed -i 's/^#.*baseurl=http/baseurl=http/g' /etc/yum.repos.d/CentOS*
@@ -84,48 +77,34 @@ cat <<EOF > /etc/ansible/00_common_setup.yml
       args:
         warn: no
 
-    - name: Install Base Utils
+    - name: Install Base Packages
       yum:
-        name:
-          - epel-release
-          - nano
-          - wget
-          - net-tools
-          - rsync
-          - socat
+        name: [epel-release, nano, wget, net-tools, rsync, socat]
         state: present
 
-    - name: Disable SELinux (Immediate)
-      command: setenforce 0
-      ignore_errors: yes
-
-    - name: Disable SELinux (Permanent)
-      lineinfile:
-        path: /etc/selinux/config
-        regexp: '^SELINUX='
-        line: 'SELINUX=disabled'
+    - name: Disable SELinux
+      shell: |
+        setenforce 0 || true
+        sed -i 's/^SELINUX=.*/SELINUX=disabled/g' /etc/selinux/config
 EOF
 
-# --- 4. ПЛЕЙБУК: GALERA CLUSTER (БД) ---
-# Используем MariaDB 10.11 (как на скрине намекалось, более свежая и стабильная)
-cat <<EOF > /etc/ansible/01_galera_cluster.yml
+# --- 4. GALERA CLUSTER (SHELL SQL MODE) ---
+cat <<EOF > /etc/ansible/01_galera.yml
 ---
-- name: Deploy MariaDB 10.11 Galera Cluster
+- name: Install MariaDB 10.11
   hosts: dbservers
   become: yes
   vars:
-    mysql_root_password: "$DB_ROOT_PASS"
-    wp_db_password: "$WP_DB_PASS"
     node1_ip: "$DB1_IP"
     node2_ip: "$DB2_IP"
 
   tasks:
-    - name: Remove Conflicting Libraries
+    - name: Clean old mariadb libs
       yum:
         name: mariadb-libs
         state: absent
 
-    - name: Add MariaDB 10.11 Repo
+    - name: Add MariaDB Repo
       copy:
         dest: /etc/yum.repos.d/mariadb.repo
         content: |
@@ -135,16 +114,12 @@ cat <<EOF > /etc/ansible/01_galera_cluster.yml
           gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
           gpgcheck=1
 
-    - name: Install MariaDB Server & Galera
+    - name: Install MariaDB Server
       yum:
-        name:
-          - MariaDB-server
-          - MariaDB-client
-          - MariaDB-shared
-          - MariaDB-backup
+        name: [MariaDB-server, MariaDB-client, MariaDB-shared, MariaDB-backup]
         state: present
 
-    - name: Configure Firewalld
+    - name: Setup Firewall
       firewalld:
         port: "{{ item }}"
         permanent: yes
@@ -166,7 +141,7 @@ cat <<EOF > /etc/ansible/01_galera_cluster.yml
           wsrep_on=ON
           wsrep_provider=/usr/lib64/galera-4/libgalera_smm.so
           wsrep_cluster_address="gcomm://{{ node1_ip }},{{ node2_ip }}"
-          wsrep_cluster_name="my_cool_cluster"
+          wsrep_cluster_name="galera_cluster"
           wsrep_node_address="{{ ansible_default_ipv4.address }}"
           wsrep_node_name="{{ ansible_hostname }}"
           binlog_format=row
@@ -174,129 +149,130 @@ cat <<EOF > /etc/ansible/01_galera_cluster.yml
           innodb_autoinc_lock_mode=2
           bind-address=0.0.0.0
 
-    - name: Ensure MariaDB is stopped before bootstrap
+    - name: Stop MariaDB explicitly before bootstrap
       systemd:
         name: mariadb
         state: stopped
 
-- name: Bootstrap Cluster (Primary Node Only)
+# --- ЭТАП ЗАПУСКА КЛАСТЕРА ---
+
+- name: Bootstrap Primary Node
   hosts: db_primary
   become: yes
   tasks:
-    - name: Start New Cluster
+    - name: Run galera_new_cluster
       command: galera_new_cluster
-      ignore_errors: yes
+
+    - name: Wait for MariaDB socket
+      wait_for:
+        path: /var/lib/mysql/mysql.sock
+        timeout: 30
 
 - name: Join Secondary Nodes
-  hosts: dbservers
+  hosts: dbservers:!db_primary
   become: yes
   tasks:
-    - name: Start MariaDB (Join Cluster)
+    - name: Start MariaDB (Join)
       systemd:
         name: mariadb
         state: started
-        enabled: yes
 
-    - name: Setup DB Users (Run Once)
-      run_once: true
-      block:
-        - name: Create Database
-          mysql_db:
-            name: wordpress_db
-            state: present
-            login_unix_socket: /var/lib/mysql/mysql.sock
+# --- ЭТАП НАСТРОЙКИ ПОЛЬЗОВАТЕЛЕЙ (SHELL SQL) ---
+# Выполняем ТОЛЬКО на мастере, Галера сама реплицирует юзеров на слейва
 
-        - name: Create WP User
-          mysql_user:
-            name: wp_user
-            password: "{{ wp_db_password }}"
-            priv: 'wordpress_db.*:ALL'
-            host: '%'
-            state: present
-            login_unix_socket: /var/lib/mysql/mysql.sock
-
-        - name: Create HAProxy Check User
-          mysql_user:
-            name: haproxy
-            host: '%'
-            state: present
-            login_unix_socket: /var/lib/mysql/mysql.sock
+- name: Configure Users and DBs (Shell Mode)
+  hosts: db_primary
+  become: yes
+  vars:
+    root_pass: "$DB_ROOT_PASS"
+    wp_pass: "$WP_DB_PASS"
+    haproxy_pass: "$HAPROXY_CHECK_PASS"
+  tasks:
+    - name: Reset Root Password & Create Users (Raw SQL)
+      shell: |
+        mysql -u root -e "
+        -- Создаем базу WP
+        CREATE DATABASE IF NOT EXISTS wordpress_db;
+        
+        -- Создаем юзера WP (доступ отовсюду %)
+        CREATE USER IF NOT EXISTS 'wp_user'@'%' IDENTIFIED BY '{{ wp_pass }}';
+        GRANT ALL PRIVILEGES ON wordpress_db.* TO 'wp_user'@'%';
+        
+        -- Создаем юзера для HAProxy (без пароля или с паролем, тут сделаем простым)
+        CREATE USER IF NOT EXISTS 'haproxy'@'%' IDENTIFIED BY '{{ haproxy_pass }}';
+        
+        -- Обновляем рута (если еще не задан)
+        ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ root_pass }}';
+        
+        FLUSH PRIVILEGES;"
+      ignore_errors: yes
 EOF
 
-# --- 5. ПЛЕЙБУК: HAPROXY ---
-cat <<EOF > /etc/ansible/02_haproxy_lb.yml
+# --- 5. HAPROXY ---
+cat <<EOF > /etc/ansible/02_haproxy.yml
 ---
-- name: Setup HAProxy Load Balancer
+- name: Deploy HAProxy
   hosts: loadbalancer
   become: yes
   vars:
-    web1_ip: "$WEB1_IP"
-    web2_ip: "$WEB2_IP"
-    db1_ip: "$DB1_IP"
-    db2_ip: "$DB2_IP"
-
+    db1: "$DB1_IP"
+    db2: "$DB2_IP"
+    web1: "$WEB1_IP"
+    web2: "$WEB2_IP"
+  
   tasks:
     - name: Install HAProxy
       yum:
         name: haproxy
         state: present
 
-    - name: Configure HAProxy
+    - name: Config HAProxy
       copy:
         dest: /etc/haproxy/haproxy.cfg
         content: |
           global
-              log         127.0.0.1 local2
-              chroot      /var/lib/haproxy
-              pidfile     /var/run/haproxy.pid
-              maxconn     4000
-              user        haproxy
-              group       haproxy
+              log 127.0.0.1 local2
+              chroot /var/lib/haproxy
+              pidfile /var/run/haproxy.pid
+              maxconn 4000
+              user haproxy
+              group haproxy
               daemon
 
           defaults
-              mode                    http
-              log                     global
-              option                  httplog
-              option                  dontlognull
-              option http-server-close
-              option forwardfor       except 127.0.0.0/8
-              option                  redispatch
-              retries                 3
-              timeout http-request    10s
-              timeout queue           1m
-              timeout connect         10s
-              timeout client          1m
-              timeout server          1m
-              timeout http-keep-alive 10s
-              timeout check           10s
-              maxconn                 3000
+              mode http
+              log global
+              option httplog
+              option dontlognull
+              timeout connect 5000
+              timeout client 50000
+              timeout server 50000
 
           frontend main_http
               bind *:80
-              default_backend web_cluster
+              default_backend web_nodes
 
-          backend web_cluster
+          backend web_nodes
               balance roundrobin
-              server web1 {{ web1_ip }}:80 check
-              server web2 {{ web2_ip }}:80 check
+              server web1 {{ web1 }}:80 check
+              server web2 {{ web2 }}:80 check
 
-          listen mysql-cluster
+          listen mariadb_galera
               bind *:3306
               mode tcp
+              balance source
+              # Проверка через mysql-check с юзером haproxy
               option mysql-check user haproxy
-              balance leastconn
-              server db1 {{ db1_ip }}:3306 check
-              server db2 {{ db2_ip }}:3306 check
+              server db1 {{ db1 }}:3306 check
+              server db2 {{ db2 }}:3306 check
 
           listen stats
               bind *:8404
               stats enable
               stats uri /monitor
-              stats refresh 5s
               stats auth admin:admin
 
-    - name: Open Firewall Ports
+    - name: Open Ports
       firewalld:
         port: "{{ item }}"
         permanent: yes
@@ -307,110 +283,82 @@ cat <<EOF > /etc/ansible/02_haproxy_lb.yml
         - 3306/tcp
         - 8404/tcp
 
-    - name: Start HAProxy
+    - name: Restart HAProxy
       systemd:
         name: haproxy
         state: restarted
         enabled: yes
 EOF
 
-# --- 6. ПЛЕЙБУК: WORDPRESS ---
-cat <<EOF > /etc/ansible/03_wordpress_nodes.yml
+# --- 6. WORDPRESS ---
+cat <<EOF > /etc/ansible/03_wordpress.yml
 ---
-- name: Deploy WordPress Nodes
+- name: Install WP
   hosts: webservers
   become: yes
   vars:
-    db_host: "$LB_IP"
-    db_name: "wordpress_db"
-    db_user: "wp_user"
-    db_pass: "$WP_DB_PASS"
-    wp_url: "https://ru.wordpress.org/latest-ru_RU.tar.gz"
+    lb_ip: "$LB_IP"
+    wp_pass: "$WP_DB_PASS"
 
   tasks:
-    - name: Install Web Stack
+    - name: Install Apache/PHP
       yum:
-        name:
-          - httpd
-          - php
-          - php-mysql
-          - php-gd
-          - wget
+        name: [httpd, php, php-mysql, php-gd, wget, unarchive]
         state: present
 
-    - name: Start HTTPD
-      systemd:
-        name: httpd
-        state: started
-        enabled: yes
-
-    - name: Open Firewall for HTTP
+    - name: Firewall HTTP
       firewalld:
         service: http
         permanent: yes
         state: enabled
         immediate: yes
 
-    - name: Check if WP already installed
-      stat:
-        path: /var/www/html/wp-config.php
-      register: wp_check
+    - name: Start Apache
+      systemd:
+        name: httpd
+        state: started
+        enabled: yes
 
-    - name: Download and Unpack WordPress
+    - name: Download WP
       unarchive:
-        src: "{{ wp_url }}"
+        src: https://wordpress.org/latest.tar.gz
         dest: /var/www/html/
         remote_src: yes
         extra_opts: [--strip-components=1]
-      when: not wp_check.stat.exists
+        creates: /var/www/html/index.php
 
-    - name: Configure wp-config.php
+    - name: Config WP
       copy:
         dest: /var/www/html/wp-config.php
         content: |
           <?php
-          define( 'DB_NAME', '{{ db_name }}' );
-          define( 'DB_USER', '{{ db_user }}' );
-          define( 'DB_PASSWORD', '{{ db_pass }}' );
-          define( 'DB_HOST', '{{ db_host }}' );
+          define( 'DB_NAME', 'wordpress_db' );
+          define( 'DB_USER', 'wp_user' );
+          define( 'DB_PASSWORD', '{{ wp_pass }}' );
+          define( 'DB_HOST', '{{ lb_ip }}' ); 
           define( 'DB_CHARSET', 'utf8' );
           define( 'DB_COLLATE', '' );
           \$table_prefix = 'wp_';
           define( 'WP_DEBUG', false );
-          if ( ! defined( 'ABSPATH' ) ) {
-            define( 'ABSPATH', __DIR__ . '/' );
-          }
+          if ( ! defined( 'ABSPATH' ) ) define( 'ABSPATH', __DIR__ . '/' );
           require_once ABSPATH . 'wp-settings.php';
 
-    - name: Set Permissions
-      file:
-        path: /var/www/html
-        owner: apache
-        group: apache
-        mode: '0755'
-        recurse: yes
+    - name: Permissions
+      shell: chown -R apache:apache /var/www/html
 EOF
 
-echo "----------------------------------------------------------------"
-echo "Скрипты сгенерированы в /etc/ansible/"
-echo "Запускаю Ansible автоматически по очереди..."
-echo "----------------------------------------------------------------"
+# --- ЗАПУСК ---
+echo "----------------------------------------------------"
+echo ">>> ЗАПУСК ПЛЕЙБУКОВ..."
 
-# Автоматический запуск (чтобы руками не тыкать)
-echo ">>> [1/4] ОБЩАЯ НАСТРОЙКА (РЕПОЗИТОРИИ)..."
-ansible-playbook /etc/ansible/00_common_setup.yml
+ansible-playbook /etc/ansible/00_common.yml
+ansible-playbook /etc/ansible/01_galera.yml
+ansible-playbook /etc/ansible/02_haproxy.yml
+ansible-playbook /etc/ansible/03_wordpress.yml
 
-echo ">>> [2/4] УСТАНОВКА GALERA CLUSTER..."
-ansible-playbook /etc/ansible/01_galera_cluster.yml
-
-echo ">>> [3/4] УСТАНОВКА HAPROXY..."
-ansible-playbook /etc/ansible/02_haproxy_lb.yml
-
-echo ">>> [4/4] УСТАНОВКА WORDPRESS..."
-ansible-playbook /etc/ansible/03_wordpress_nodes.yml
-
-echo "----------------------------------------------------------------"
-echo "ГОТОВО! ПРОВЕРЯЙ:"
-echo "Статистика HAProxy: http://$LB_IP:8404/monitor (login: admin/admin)"
-echo "WordPress сайт: http://$LB_IP"
-echo "----------------------------------------------------------------"
+echo "----------------------------------------------------"
+echo "ГОТОВО. ПРОВЕРКА:"
+echo "1. Зайди на http://$LB_IP:8404/monitor (admin:admin) и убедись, что SQL сервера зеленые."
+echo "2. Если базы красные в HAProxy - проверь, создался ли юзер: mysql -u haproxy -h $DB1_IP"
+echo "3. Сайт: http://$LB_IP"
+echo "----------------------------------------------------"
