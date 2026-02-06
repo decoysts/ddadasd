@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # =================================================================
-# ULTIMATE HA CLUSTER DEPLOYMENT SCRIPT (RU WP VERSION)
-# Role: HAProxy + Galera Cluster (2 Nodes) + WordPress (2 Nodes)
+# ULTIMATE HA CLUSTER DEPLOYMENT SCRIPT (REMASTERED)
+# Fixes: Dead CentOS 7 Repos on ALL nodes, SELinux disabled, MariaDB 10.11
 # =================================================================
 
-# --- 0. НАСТРОЙКИ IP (Впиши сюда свои адреса!) ---
+# --- 0. НАСТРОЙКИ IP (ПРОВЕРЬ ПЕРЕД ЗАПУСКОМ!) ---
 # Балансировщик
 LB_IP="192.168.4.10"
 
@@ -22,10 +22,12 @@ DB_ROOT_PASS="password3204"
 WP_DB_PASS="wppassword"
 HAPROXY_CHECK_PASS="haproxypass"
 
-echo ">>> Начинаем развертывание ебейшего кластера (RU)..."
+echo ">>> [INIT] Начинаем развертывание правильного кластера..."
 
-# --- 1. СИСТЕМНАЯ ПОДГОТОВКА ---
-echo ">>> Фикс репозиториев и установка Ansible..."
+# --- 1. ЛОКАЛЬНАЯ ПОДГОТОВКА (Машина, где запущен скрипт) ---
+echo ">>> [LOCAL] Фикс локальных репозиториев и установка Ansible..."
+
+# Фикс репозиториев (стиль из твоих скринов)
 sed -i 's/mirror.centos.org/vault.centos.org/g' /etc/yum.repos.d/CentOS*
 sed -i 's/^#.*baseurl=http/baseurl=http/g' /etc/yum.repos.d/CentOS*
 sed -i 's/^mirrorlist=http/#mirrorlist=http/g' /etc/yum.repos.d/CentOS*
@@ -34,8 +36,15 @@ yum install -y epel-release
 yum install -y ansible
 
 # --- 2. ГЕНЕРАЦИЯ ИНВЕНТАРЯ ---
-echo ">>> Создаем /etc/ansible/hosts..."
+echo ">>> [INVENTORY] Создаем /etc/ansible/hosts..."
 cat <<EOF > /etc/ansible/hosts
+[all_servers]
+$LB_IP
+$WEB1_IP
+$WEB2_IP
+$DB1_IP
+$DB2_IP
+
 [loadbalancer]
 $LB_IP
 
@@ -51,42 +60,91 @@ $DB2_IP
 $DB1_IP
 EOF
 
-# --- 3. ПЛЕЙБУК: GALERA CLUSTER (БД) ---
-cat <<EOF > /etc/ansible/galera_cluster.yml
+# Отключаем проверку ключей SSH (чтобы не спрашивал yes/no)
+cat <<EOF > /etc/ansible/ansible.cfg
+[defaults]
+host_key_checking = False
+deprecation_warnings = False
+command_warnings = False
+EOF
+
+# --- 3. ПЛЕЙБУК: ОБЩАЯ НАСТРОЙКА (ВАЖНО!) ---
+# Этот плейбук чинит репозитории на ВСЕХ нодах перед установкой чего-либо.
+cat <<EOF > /etc/ansible/00_common_setup.yml
 ---
-- name: Deploy MariaDB Galera Cluster
+- name: Prepare ALL Servers (Repos & SELinux)
+  hosts: all_servers
+  become: yes
+  tasks:
+    - name: Fix CentOS 7 Repositories (Vault)
+      shell: |
+        sed -i 's/mirror.centos.org/vault.centos.org/g' /etc/yum.repos.d/CentOS*
+        sed -i 's/^#.*baseurl=http/baseurl=http/g' /etc/yum.repos.d/CentOS*
+        sed -i 's/^mirrorlist=http/#mirrorlist=http/g' /etc/yum.repos.d/CentOS*
+      args:
+        warn: no
+
+    - name: Install Base Utils
+      yum:
+        name:
+          - epel-release
+          - nano
+          - wget
+          - net-tools
+          - rsync
+          - socat
+        state: present
+
+    - name: Disable SELinux (Immediate)
+      command: setenforce 0
+      ignore_errors: yes
+
+    - name: Disable SELinux (Permanent)
+      lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: 'SELINUX=disabled'
+EOF
+
+# --- 4. ПЛЕЙБУК: GALERA CLUSTER (БД) ---
+# Используем MariaDB 10.11 (как на скрине намекалось, более свежая и стабильная)
+cat <<EOF > /etc/ansible/01_galera_cluster.yml
+---
+- name: Deploy MariaDB 10.11 Galera Cluster
   hosts: dbservers
   become: yes
   vars:
     mysql_root_password: "$DB_ROOT_PASS"
-    haproxy_user_password: "$HAPROXY_CHECK_PASS"
     wp_db_password: "$WP_DB_PASS"
     node1_ip: "$DB1_IP"
     node2_ip: "$DB2_IP"
 
   tasks:
-    - name: Добавляем репозиторий MariaDB 10.5
+    - name: Remove Conflicting Libraries
+      yum:
+        name: mariadb-libs
+        state: absent
+
+    - name: Add MariaDB 10.11 Repo
       copy:
         dest: /etc/yum.repos.d/mariadb.repo
         content: |
           [mariadb]
           name = MariaDB
-          baseurl = http://yum.mariadb.org/10.5/centos7-amd64
+          baseurl = http://yum.mariadb.org/10.11/centos7-amd64
           gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
           gpgcheck=1
 
-    - name: Установка пакетов MariaDB и Galera
+    - name: Install MariaDB Server & Galera
       yum:
         name:
           - MariaDB-server
           - MariaDB-client
-          - MariaDB-common
-          - socat
-          - rsync
-          - MySQL-python
+          - MariaDB-shared
+          - MariaDB-backup
         state: present
 
-    - name: Открываем порты Firewall
+    - name: Configure Firewalld
       firewalld:
         port: "{{ item }}"
         permanent: yes
@@ -99,9 +157,10 @@ cat <<EOF > /etc/ansible/galera_cluster.yml
         - 4444/tcp
         - 4567/udp
 
-    - name: Конфигурация server.cnf для Galera
+    - name: Configure server.cnf
       blockinfile:
         path: /etc/my.cnf.d/server.cnf
+        create: yes
         block: |
           [galera]
           wsrep_on=ON
@@ -115,39 +174,39 @@ cat <<EOF > /etc/ansible/galera_cluster.yml
           innodb_autoinc_lock_mode=2
           bind-address=0.0.0.0
 
-    - name: Остановка MariaDB перед бутстрапом
+    - name: Ensure MariaDB is stopped before bootstrap
       systemd:
         name: mariadb
         state: stopped
 
-- name: Bootstrap Cluster (Первая нода)
+- name: Bootstrap Cluster (Primary Node Only)
   hosts: db_primary
   become: yes
   tasks:
-    - name: Запуск нового кластера
+    - name: Start New Cluster
       command: galera_new_cluster
       ignore_errors: yes
 
-- name: Start other nodes
+- name: Join Secondary Nodes
   hosts: dbservers
   become: yes
   tasks:
-    - name: Запуск MariaDB
+    - name: Start MariaDB (Join Cluster)
       systemd:
         name: mariadb
         state: started
         enabled: yes
 
-    - name: Создание базы и юзеров (run_once)
+    - name: Setup DB Users (Run Once)
       run_once: true
       block:
-        - name: Создать базу WordPress
+        - name: Create Database
           mysql_db:
             name: wordpress_db
             state: present
             login_unix_socket: /var/lib/mysql/mysql.sock
 
-        - name: Создать юзера для WP
+        - name: Create WP User
           mysql_user:
             name: wp_user
             password: "{{ wp_db_password }}"
@@ -156,7 +215,7 @@ cat <<EOF > /etc/ansible/galera_cluster.yml
             state: present
             login_unix_socket: /var/lib/mysql/mysql.sock
 
-        - name: Создать юзера для HAProxy check
+        - name: Create HAProxy Check User
           mysql_user:
             name: haproxy
             host: '%'
@@ -164,8 +223,8 @@ cat <<EOF > /etc/ansible/galera_cluster.yml
             login_unix_socket: /var/lib/mysql/mysql.sock
 EOF
 
-# --- 4. ПЛЕЙБУК: HAPROXY (БАЛАНСЕР) ---
-cat <<EOF > /etc/ansible/haproxy_lb.yml
+# --- 5. ПЛЕЙБУК: HAPROXY ---
+cat <<EOF > /etc/ansible/02_haproxy_lb.yml
 ---
 - name: Setup HAProxy Load Balancer
   hosts: loadbalancer
@@ -182,11 +241,7 @@ cat <<EOF > /etc/ansible/haproxy_lb.yml
         name: haproxy
         state: present
 
-    - name: Разрешить HAProxy коннектиться (SELinux)
-      command: setsebool -P haproxy_connect_any 1
-      ignore_errors: yes
-
-    - name: Настройка конфига haproxy.cfg
+    - name: Configure HAProxy
       copy:
         dest: /etc/haproxy/haproxy.cfg
         content: |
@@ -239,8 +294,9 @@ cat <<EOF > /etc/ansible/haproxy_lb.yml
               stats enable
               stats uri /monitor
               stats refresh 5s
+              stats auth admin:admin
 
-    - name: Открыть порты Firewall
+    - name: Open Firewall Ports
       firewalld:
         port: "{{ item }}"
         permanent: yes
@@ -258,10 +314,10 @@ cat <<EOF > /etc/ansible/haproxy_lb.yml
         enabled: yes
 EOF
 
-# --- 5. ПЛЕЙБУК: WORDPRESS (ВЕБ-СЕРВЕРА) ---
-cat <<EOF > /etc/ansible/wordpress_nodes.yml
+# --- 6. ПЛЕЙБУК: WORDPRESS ---
+cat <<EOF > /etc/ansible/03_wordpress_nodes.yml
 ---
-- name: Deploy WordPress Nodes (RU)
+- name: Deploy WordPress Nodes
   hosts: webservers
   become: yes
   vars:
@@ -269,7 +325,6 @@ cat <<EOF > /etc/ansible/wordpress_nodes.yml
     db_name: "wordpress_db"
     db_user: "wp_user"
     db_pass: "$WP_DB_PASS"
-    # ССЫЛКА НА РУССКИЙ WORDPRESS
     wp_url: "https://ru.wordpress.org/latest-ru_RU.tar.gz"
 
   tasks:
@@ -289,26 +344,27 @@ cat <<EOF > /etc/ansible/wordpress_nodes.yml
         state: started
         enabled: yes
 
-    - name: Firewall HTTP
+    - name: Open Firewall for HTTP
       firewalld:
         service: http
         permanent: yes
         state: enabled
         immediate: yes
 
-    - name: Download Russian WordPress
-      get_url:
-        url: "{{ wp_url }}"
-        dest: /tmp/wordpress.tar.gz
+    - name: Check if WP already installed
+      stat:
+        path: /var/www/html/wp-config.php
+      register: wp_check
 
-    - name: Unpack WP
+    - name: Download and Unpack WordPress
       unarchive:
-        src: /tmp/wordpress.tar.gz
+        src: "{{ wp_url }}"
         dest: /var/www/html/
         remote_src: yes
         extra_opts: [--strip-components=1]
+      when: not wp_check.stat.exists
 
-    - name: Настройка wp-config.php
+    - name: Configure wp-config.php
       copy:
         dest: /var/www/html/wp-config.php
         content: |
@@ -326,24 +382,35 @@ cat <<EOF > /etc/ansible/wordpress_nodes.yml
           }
           require_once ABSPATH . 'wp-settings.php';
 
-    - name: Права доступа
+    - name: Set Permissions
       file:
         path: /var/www/html
         owner: apache
         group: apache
         mode: '0755'
         recurse: yes
-      
-    - name: SELinux httpd network connect
-      command: setsebool -P httpd_can_network_connect 1
-      ignore_errors: yes
 EOF
 
 echo "----------------------------------------------------------------"
-echo "Конфигурация завершена. Файлы лежат в /etc/ansible/"
-echo ""
-echo "ЗАПУСК:"
-echo "1. ansible-playbook /etc/ansible/galera_cluster.yml"
-echo "2. ansible-playbook /etc/ansible/haproxy_lb.yml"
-echo "3. ansible-playbook /etc/ansible/wordpress_nodes.yml"
+echo "Скрипты сгенерированы в /etc/ansible/"
+echo "Запускаю Ansible автоматически по очереди..."
+echo "----------------------------------------------------------------"
+
+# Автоматический запуск (чтобы руками не тыкать)
+echo ">>> [1/4] ОБЩАЯ НАСТРОЙКА (РЕПОЗИТОРИИ)..."
+ansible-playbook /etc/ansible/00_common_setup.yml
+
+echo ">>> [2/4] УСТАНОВКА GALERA CLUSTER..."
+ansible-playbook /etc/ansible/01_galera_cluster.yml
+
+echo ">>> [3/4] УСТАНОВКА HAPROXY..."
+ansible-playbook /etc/ansible/02_haproxy_lb.yml
+
+echo ">>> [4/4] УСТАНОВКА WORDPRESS..."
+ansible-playbook /etc/ansible/03_wordpress_nodes.yml
+
+echo "----------------------------------------------------------------"
+echo "ГОТОВО! ПРОВЕРЯЙ:"
+echo "Статистика HAProxy: http://$LB_IP:8404/monitor (login: admin/admin)"
+echo "WordPress сайт: http://$LB_IP"
 echo "----------------------------------------------------------------"
